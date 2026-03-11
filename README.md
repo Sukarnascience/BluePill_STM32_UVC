@@ -1,452 +1,736 @@
 # STM32F103C8T6 Blue Pill — Composite USB Device
-### CDC ACM Serial + UVC Camera | Raw USB Registers | No HAL | No CubeMX | ST-Link flash
+### CDC ACM Serial + UVC Camera | Raw USB Registers | No HAL | No CubeMX
 
 ---
 
 ## What Is This Project?
 
-This project turns a **STM32F103C8T6 "Blue Pill"** board into a **composite USB device** that presents two interfaces simultaneously when plugged into any PC:
+A **STM32F103C8T6 "Blue Pill"** presenting two USB functions simultaneously on one cable:
 
-- **CDC ACM Serial** → appears as a virtual COM port (`COMx` on Windows, `/dev/ttyACMx` on Linux)
-- **UVC Camera** → appears as a webcam, streams a grayscale test pattern
+- **CDC ACM** → virtual COM port (`COMx` on Windows, `/dev/ttyACMx` on Linux)
+- **UVC Camera** → webcam streaming 176×144 YUY2 grayscale test pattern
 
-No custom driver needed. Both CDC ACM and UVC are natively supported by every modern OS.
-
-> **Goal:** Understand how composite USB, CDC ACM, and UVC work at the protocol level before moving to higher-end STM32 H-series hardware.
-
----
-
-## Board Specs — STM32F103C8T6
-
-| Property | Value | Notes |
-|---|---|---|
-| Core | ARM Cortex-M3 | No FPU |
-| Clock | 48 MHz | HSE 8MHz × PLL×6 (USB requires crystal) |
-| Flash | 64 KB | Some chips have 128 KB |
-| RAM | 20 KB | Biggest constraint for UVC |
-| USB | Full-Speed (FS) 12 Mbps | Built-in, no external PHY needed |
-| USB Pins | PA11 (D−), PA12 (D+) | Fixed, cannot remap |
-| USB Buffer SRAM (PMA) | 512 bytes | Shared across all endpoints |
-| Package | LQFP48 | "Blue Pill" dev board |
+No custom driver needed. No HAL USB middleware. No libopencm3. Every USB register
+write, every descriptor byte, every handshake is done by hand in C and documented here.
 
 ---
 
-## Why Raw Registers and NOT Arduino/HAL?
+## How the STM32 Talks to the Computer — The Full Story
 
-| Framework | USB Control | Code Size | Learning Value |
-|---|---|---|---|
-| STM32duino (Arduino) | Hidden | Large | Low |
-| STM32 HAL (CubeMX) | Partial | Very large | Medium |
-| **Raw registers (this project)** | **Full** | **Minimal** | **High** |
-
-For learning USB at the protocol level, **you want to see every byte**. Raw register access means nothing is hidden.
+This is the part most documentation skips. Here is exactly what happens, byte by byte,
+from the moment you plug in the USB cable to the moment Windows opens a COM port.
 
 ---
 
-## Device Layout
+### Phase 0 — Physical Signal (Before Any Code Runs)
 
-When plugged in, Windows/Linux sees one composite device with two child interfaces:
+USB Full-Speed devices signal their presence by pulling **D+ high** through a 1.5kΩ
+resistor. The host detects this rising edge and knows "a full-speed device just connected."
+
+On Blue Pill, D+ is **PA12**. Our firmware controls the connect/disconnect:
+
+```c
+// Step 1: Pull PA12 LOW at startup — force D+ low = host sees nothing
+GPIO_InitTypeDef g = {0};
+g.Pin  = GPIO_PIN_12;
+g.Mode = GPIO_MODE_OUTPUT_PP;
+HAL_GPIO_Init(GPIOA, &g);
+HAL_GPIO_WritePin(GPIOA, GPIO_PIN_12, GPIO_PIN_RESET);  // D+ = 0V
+
+// Step 2: Hold low for 500ms — if re-flashing, host sees clean disconnect
+HAL_Delay(500);
+
+// Step 3: Init USB peripheral registers, THEN release PA12
+g.Mode = GPIO_MODE_INPUT;   // PA12 = input = floating
+HAL_GPIO_Init(GPIOA, &g);
+// Now the 1.5kΩ pull-up resistor on the Blue Pill board pulls D+ to 3.3V
+// Host detects rising edge on D+ → "new full-speed device connected"
+```
+
+Why do this? If you just power up with D+ always high, the host may not reset its
+device state properly after a reflash. The 500ms low pulse guarantees a clean connect.
+
+---
+
+### Phase 1 — USB Reset (Host Takes Control)
+
+Within 100ms of detecting D+, the host forces a **USB Reset** — it drives both D+ and D−
+to 0V (called SE0) for at least 10ms. This resets all device state.
+
+Our USB peripheral fires the **RESET interrupt flag** in `USB_ISTR`. We handle it:
+
+```c
+// What we do on every USB Reset:
+void handle_reset(void) {
+    // 1. Tell peripheral where the Buffer Table lives in PMA
+    USB_BTABLE = 0;  // BTABLE starts at PMA logical offset 0x00
+
+    // 2. Set up EP0 TX buffer (where we put our replies)
+    BTABLE_ADDR_TX(0) = 0x40;  // logical offset 0x40 in PMA
+    BTABLE_CNT_TX(0)  = 0;     // nothing to send yet
+
+    // 3. Set up EP0 RX buffer (where host SETUP packets land)
+    BTABLE_ADDR_RX(0) = 0x80;  // logical offset 0x80 in PMA
+    BTABLE_CNT_RX(0)  = (1<<15)|(2<<10);  // tell hardware: buffer = 64 bytes
+    //  ^^ BL_SIZE=1 means 32-byte blocks, NUM_BLOCK=2 means 2 blocks = 64 bytes
+
+    // 4. Configure EP0 as CONTROL type, address 0
+    USB_EPR(0) = EP_TYPE_CTRL | 0x00;
+    ep_stat_tx(0, STAT_NAK);    // TX: not ready yet
+    ep_stat_rx(0, STAT_VALID);  // RX: ready to receive SETUP packets
+
+    // 5. Enable device at address 0
+    USB_DADDR = 0x80;  // bit 7 (EF) = 1 means "device enabled", addr = 0
+}
+```
+
+After reset, device is at address 0, EP0 is open, everything else is closed.
+The host can now begin the enumeration conversation.
+
+---
+
+### Phase 2 — Enumeration (The Question and Answer Session)
+
+Enumeration is a strict sequence of control transfers on EP0. The host asks questions;
+we answer with pre-built byte arrays stored in Flash. Here is every exchange:
+
+---
+
+#### Exchange 1 — GET_DESCRIPTOR (Device), first 8 bytes
+
+The very first thing the host asks. It only requests 8 bytes initially because it needs
+to know `bMaxPacketSize0` before requesting more.
+
+**Host sends this SETUP packet (8 bytes arrive in our EP0 RX buffer):**
+```
+Byte  Value  Meaning
+[0]   0x80   bmRequestType: direction=Device→Host, type=Standard, recipient=Device
+[1]   0x06   bRequest: GET_DESCRIPTOR
+[2]   0x00   wValue low: descriptor index = 0
+[3]   0x01   wValue high: descriptor type = DEVICE (0x01)
+[4]   0x00   wIndex = 0 (not used for device descriptor)
+[5]   0x00
+[6]   0x08   wLength = 8 (host only wants 8 bytes on first ask)
+[7]   0x00
+```
+
+**We reply with first 8 bytes of our device descriptor:**
+```
+Byte  Value   Meaning
+[0]   0x12    bLength = 18 (full descriptor is 18 bytes)
+[1]   0x01    bDescriptorType = DEVICE
+[2]   0x00    bcdUSB low
+[3]   0x02    bcdUSB high → 0x0200 = USB 2.0
+[4]   0xEF    bDeviceClass = 0xEF (Miscellaneous — required for IAD composite)
+[5]   0x02    bDeviceSubClass = 0x02
+[6]   0x01    bDeviceProtocol = 0x01 (IAD)
+[7]   0x40    bMaxPacketSize0 = 64 bytes
+```
+
+Windows reads `bMaxPacketSize0=64` and knows EP0 can handle 64-byte packets.
+It also reads `bDeviceClass=0xEF` and thinks: *"this is a composite IAD device,
+I need to look at the config descriptor to find out what functions it has."*
+
+**How we ACK at the hardware level:**
+
+When we put data in the EP0 TX PMA buffer and call `ep_stat_tx(0, STAT_VALID)`,
+the USB hardware automatically handles the low-level handshake:
 
 ```
-USB Composite Device  (VID=0xCAFE, PID=0x4002)
-│
-├── Interface 0+1: CDC ACM  →  "USB Serial Device (COMx)"
-│     EP0: Control (shared)
-│     EP1 IN/OUT: Bulk 64B   ← serial data
-│     EP2 IN: Interrupt 8B   ← CDC notifications (NAK only)
-│
-└── Interface 2+3: UVC  →  "BeeComposite" camera
-      EP0: Control (shared)
-      EP3 IN: Isochronous 512B  ← video frames
+Host sends:   SETUP token + 8 data bytes
+STM32 HW:     sends ACK handshake automatically (hardware, not firmware)
+Host sends:   IN token (asking for our response)
+STM32 HW:     sends our 8 bytes from PMA + DATA1 PID
+Host sends:   ACK handshake
+STM32 HW:     fires CTR (Correct Transfer) flag in USB_ISTR
+Our code:     sees CTR, clears it, continues
+```
+
+We never manually send ACK tokens — the USB hardware does that automatically.
+Our job is only to put data in the PMA buffer and set `STAT_VALID`.
+
+---
+
+#### Exchange 2 — USB Reset (Again)
+
+After reading the first 8 bytes, the host issues another USB Reset. This is normal —
+Windows resets the device to "properly" start enumeration now that it knows the
+max packet size. Our `handle_reset()` runs again, back to address 0.
+
+---
+
+#### Exchange 3 — GET_DESCRIPTOR (Device), full 18 bytes
+
+Same request, `wLength=0x12` (18) this time. We send the complete device descriptor:
+
+```
+Byte  Value   Meaning
+[0]   0x12    bLength = 18
+[1]   0x01    DEVICE descriptor type
+[2]   0x00    bcdUSB = 0x0200
+[3]   0x02
+[4]   0xEF    bDeviceClass: Miscellaneous (composite IAD)
+[5]   0x02    bDeviceSubClass
+[6]   0x01    bDeviceProtocol
+[7]   0x40    bMaxPacketSize0 = 64
+[8]   0xFE    idVendor low  = 0xCAFE
+[9]   0xCA    idVendor high
+[10]  0x02    idProduct low = 0x4002
+[11]  0x40    idProduct high
+[12]  0x00    bcdDevice low = 0x0100 (device version 1.0)
+[13]  0x01    bcdDevice high
+[14]  0x01    iManufacturer = string index 1
+[15]  0x02    iProduct = string index 2
+[16]  0x03    iSerialNumber = string index 3
+[17]  0x01    bNumConfigurations = 1
+```
+
+Windows stores this and moves to the next question.
+
+---
+
+#### Exchange 4 — SET_ADDRESS
+
+Windows assigns our device a unique address on the USB bus (e.g. address 5).
+
+**SETUP packet:**
+```
+[0] 0x00   bmRequestType: Host→Device, Standard, Device
+[1] 0x05   bRequest: SET_ADDRESS
+[2] 0x05   wValue = 5 (new address)
+[3] 0x00
+[4] 0x00   wIndex = 0
+...
+[6] 0x00   wLength = 0 (no data phase)
+```
+
+**Critical timing — why we use `pending_addr`:**
+
+```c
+// WRONG — applying address immediately breaks enumeration:
+USB_DADDR = 0x80 | 5;  // ← DON'T do this here
+ep0_zlp();             // ZLP sent from wrong address, host misses it
+
+// CORRECT:
+pending_addr = 5;   // save it
+ep0_zlp();          // send ZLP ACK from address 0 (host still listening on 0)
+// ... in EP0 IN complete handler, AFTER ZLP is confirmed sent:
+USB_DADDR = 0x80 | pending_addr;  // NOW switch to address 5
+pending_addr = 0;
+```
+
+The ZLP (zero-length packet) is the ACK for SET_ADDRESS. It must leave from
+**address 0** because the host is still listening there. Only after the host
+receives the ZLP does it start talking to address 5.
+
+After this, all further traffic goes to address 5. Any packet to address 0 is ignored.
+
+---
+
+#### Exchange 5 — GET_DESCRIPTOR (Configuration), first 9 bytes
+
+Windows asks for the configuration descriptor, `wLength=9` first to get the total length.
+
+**We reply with first 9 bytes:**
+```
+Byte  Value  Meaning
+[0]   0x09   bLength = 9
+[1]   0x02   bDescriptorType = CONFIGURATION
+[2]   0xE4   wTotalLength low = 228  ← total bytes of config + all child descriptors
+[3]   0x00   wTotalLength high
+[4]   0x04   bNumInterfaces = 4 (IF0, IF1 = CDC; IF2, IF3 = UVC)
+[5]   0x01   bConfigurationValue = 1
+[6]   0x00   iConfiguration = 0 (no string)
+[7]   0x80   bmAttributes: bus-powered, no remote wakeup
+[8]   0xFA   bMaxPower = 250 × 2mA = 500mA max draw
+```
+
+Windows reads `wTotalLength=228` and thinks: *"I need to ask for 228 bytes to get
+the full picture."*
+
+---
+
+#### Exchange 6 — GET_DESCRIPTOR (Configuration), full 228 bytes
+
+Windows asks again with `wLength=228`. We send all 228 bytes. Because EP0 TX is
+64 bytes max, we send it in **4 chunks**: 64 + 64 + 64 + 36 bytes.
+
+Our `ep0_next()` function handles this automatically:
+
+```c
+// Called on every EP0 IN complete interrupt:
+void ep0_next(void) {
+    if (ep0_sent < ep0_len) {
+        uint16_t remaining = ep0_len - ep0_sent;
+        uint16_t chunk = remaining > 64 ? 64 : remaining;
+        pma_write(EP0TX, ep0_ptr + ep0_sent, chunk);
+        BTABLE_CNT_TX(0) = chunk;
+        ep_stat_tx(0, STAT_VALID);  // release chunk to host
+        ep0_sent += chunk;
+    }
+    // if ep0_sent == ep0_len: nothing more to send, host sends STATUS OUT
+}
+```
+
+**Inside the 228 bytes, Windows finds the IAD descriptors:**
+
+```
+Offset 9:  IAD — bFirstInterface=0, bInterfaceCount=2, bFunctionClass=0x02 (CDC)
+           → "interfaces 0 and 1 together = one CDC function"
+
+Offset 17: Interface 0 (CDC Control) — Windows loads usbser.sys for this IAD group
+Offset 26: CDC functional descriptors (Header, CallMgmt, ACM, Union)
+Offset 45: EP2 Interrupt IN — CDC notification endpoint
+Offset 52: Interface 1 (CDC Data)
+Offset 61: EP1 Bulk OUT — serial data from host to device
+Offset 68: EP1 Bulk IN  — serial data from device to host
+
+Offset 75: IAD — bFirstInterface=2, bInterfaceCount=2, bFunctionClass=0x0E (Video)
+           → "interfaces 2 and 3 together = one Video function"
+
+Offset 83: Interface 2 (VideoControl) — Windows loads usbvideo.sys for this IAD group
+Offset 92: VC Header descriptor — UVC version, total VC length
+Offset 105: Input Terminal — "I have a camera, type=ITT_CAMERA"
+Offset 123: Output Terminal — "output goes to USB, linked to terminal 1"
+Offset 132: Interface 3 alt0 (VideoStreaming, zero bandwidth)
+Offset 141: Interface 3 alt1 (VideoStreaming, active, has ISO endpoint)
+Offset 150: EP3 ISO IN — 512 bytes, every 1ms
+Offset 157: VS Input Header — format count, endpoint address, terminal link
+Offset 171: VS Format — YUY2 GUID, bits per pixel
+Offset 198: VS Frame — 176×144, 5fps, frame buffer size
+```
+
+This is how Windows knows what drivers to load — it reads `bFunctionClass` from
+each IAD and loads the matching inbox driver.
+
+---
+
+#### Exchange 7 — GET_DESCRIPTOR (String 0 — Language List)
+
+```
+Host asks: wValue=0x0300 (string descriptor, index 0)
+We reply:  [0x04, 0x03, 0x09, 0x04]
+            bLength=4, STRING type, wLANGID=0x0409 (English US)
+```
+
+Windows now knows we support English strings. It will ask for string indices 1, 2, 3.
+
+---
+
+#### Exchange 8, 9, 10 — GET_DESCRIPTOR (Strings 1, 2, 3)
+
+All strings are **UTF-16LE** encoded — every ASCII character takes 2 bytes:
+
+```c
+// "BeeBotix" in UTF-16LE:
+static const uint8_t s_mfr[] = {
+    18, 0x03,                           // bLength=18, STRING type
+    'B',0, 'e',0, 'e',0, 'B',0,        // B e e B
+    'o',0, 't',0, 'i',0, 'x',0         // o t i x
+};
+// 2 + 8×2 = 18 bytes total ✓
+
+// "BeeComposite" in UTF-16LE:
+static const uint8_t s_prod[] = {
+    26, 0x03,
+    'B',0,'e',0,'e',0,'C',0,'o',0,'m',0,
+    'p',0,'o',0,'s',0,'i',0,'t',0,'e',0
+};
+// 2 + 12×2 = 26 bytes total ✓
+```
+
+Windows shows these strings in Device Manager under "Properties".
+
+---
+
+#### Exchange 11 — SET_CONFIGURATION (1)
+
+```
+Host sends:
+[0] 0x00   Host→Device, Standard, Device
+[1] 0x09   SET_CONFIGURATION
+[2] 0x01   bConfigurationValue = 1 (activate config 1)
+[3] 0x00
+...
+[6] 0x00   wLength = 0
+```
+
+This is the "go" signal. We open all the data endpoints:
+
+```c
+// Open EP1 for CDC bulk data
+USB_EPR(1) = EP_TYPE_BULK | 0x01;
+BTABLE_ADDR_TX(1) = 0xC0;              // TX buffer at PMA logical 0xC0
+BTABLE_ADDR_RX(1) = 0x100;             // RX buffer at PMA logical 0x100
+BTABLE_CNT_RX(1)  = (1<<15)|(2<<10);  // 64 bytes
+ep_stat_tx(1, STAT_NAK);    // nothing to send yet
+ep_stat_rx(1, STAT_VALID);  // ready to receive from host
+
+// Open EP2 for CDC interrupt notifications (we just NAK it forever)
+USB_EPR(2) = EP_TYPE_INTR | 0x82;
+ep_stat_tx(2, STAT_NAK);
+
+// EP3 (UVC ISO) stays DISABLED until SET_INTERFACE alt=1
+
+ep0_zlp();  // ACK the SET_CONFIGURATION
+```
+
+After this ZLP, **enumeration is complete**. Windows fires the "device connected" sound.
+
+---
+
+### Phase 3 — CDC Driver Handshake (usbser.sys)
+
+Windows loaded `usbser.sys` for the CDC IAD. Before exposing the COM port to applications,
+the driver sends three class-specific requests:
+
+#### SET_LINE_CODING (0x20)
+
+```
+Host sends 7-byte payload over EP0 OUT:
+Bytes 0-3:  dwDTERate   = 0x00, 0xC2, 0x01, 0x00  → 115200 baud (little-endian)
+Byte  4:    bCharFormat = 0x00  → 1 stop bit
+Byte  5:    bParityType = 0x00  → no parity
+Byte  6:    bDataBits   = 0x08  → 8 data bits
+```
+
+We store this and reply with a ZLP. We never configure a UART — data flows at USB speed.
+The baud rate is metadata only, for application-layer compatibility.
+
+#### SET_CONTROL_LINE_STATE (0x22)
+
+```
+Host sends SETUP with wValue:
+  bit 0 = DTR (1 = terminal app opened the port)
+  bit 1 = RTS
+
+We reply ZLP. A real modem would assert hardware flow control lines.
+We ignore it — no hardware lines to toggle.
+```
+
+#### GET_LINE_CODING (0x21)
+
+```
+Host asks: "confirm your line coding"
+We reply:  same 7 bytes we stored from SET_LINE_CODING
+```
+
+After these three exchanges, **the COM port appears in Device Manager**.
+Any application (PuTTY, Python, your own code) can now `open("COM10")`.
+
+---
+
+### Phase 4 — UVC Driver Handshake (usbvideo.sys)
+
+Windows loaded `usbvideo.sys` for the Video IAD. Before any video flows:
+
+#### Probe & Commit Negotiation
+
+```
+Host                                           STM32
+ |                                                |
+ |── SET_CUR VS_PROBE_CONTROL ──────────────────>|
+ |   26-byte uvc_probe_t on EP0 OUT               |  "Can you stream 176×144 YUY2 at 5fps?"
+ |<── ZLP ACK ─────────────────────────────────── |  we store it
+ |                                                |
+ |── GET_CUR VS_PROBE_CONTROL ──────────────────>|  "What can you actually do?"
+ |<── 26-byte uvc_probe_t on EP0 IN ─────────── |  we return our supported params
+ |                                                |
+ |── SET_CUR VS_COMMIT_CONTROL ─────────────────>|  "Locked in. These are the params."
+ |<── ZLP ACK ─────────────────────────────────── |
+ |                                                |
+ |── SET_INTERFACE (IF3, alt=1) ─────────────────>|  "Open the ISO endpoint, start streaming"
+ |<── ZLP ACK ─────────────────────────────────── |
+```
+
+The `uvc_probe_t` structure (26 bytes) contains:
+
+```c
+typedef struct __attribute__((packed)) {
+    uint16_t bmHint;                    // 0x0001 = dwFrameInterval is fixed
+    uint8_t  bFormatIndex;              // 1 = our YUY2 format
+    uint8_t  bFrameIndex;               // 1 = our 176×144 frame
+    uint32_t dwFrameInterval;           // 2000000 = 5fps (in 100ns units)
+    uint16_t wKeyFrameRate;             // 0
+    uint16_t wPFrameRate;               // 0
+    uint16_t wCompQuality;              // 0
+    uint16_t wCompWindowSize;           // 0
+    uint16_t wDelay;                    // 0
+    uint32_t dwMaxVideoFrameSize;       // 50688 = 176×144×2
+    uint32_t dwMaxPayloadTransferSize;  // 512 = our ISO packet size
+} uvc_probe_t;
+```
+
+When `SET_INTERFACE alt=1` arrives, we enable EP3:
+
+```c
+USB_EPR(3) = EP_TYPE_ISO | 0x03;
+BTABLE_ADDR_TX(3) = 0x180;  // ISO TX buffer at PMA logical 0x180
+BTABLE_CNT_TX(3)  = 0;
+ep_stat_tx(3, STAT_VALID);  // release to host — ISO starts immediately
+streaming = 1;
 ```
 
 ---
 
-## How It Works — Full Theory
+### Phase 5 — Isochronous Video Stream
 
-### 1. The Composite Trick — IAD
+Every 1ms the USB host sends a Start-Of-Frame (SOF) token. Our EP3 fires. We put
+the next 512 bytes of video data in PMA and release it.
 
-A normal USB device has one function. A composite device has multiple functions (serial + camera) on one USB connection. The host needs to know which interfaces belong together. This is done via **Interface Association Descriptors (IAD)**:
-
+**Every packet structure:**
 ```
-Configuration Descriptor
-├── IAD  (bFirstInterface=0, bInterfaceCount=2, Class=CDC)
-│     └── tells host: "IF0 and IF1 are one CDC function"
-├── Interface 0 (CDC Control)
-├── Interface 1 (CDC Data)
-├── IAD  (bFirstInterface=2, bInterfaceCount=2, Class=Video)
-│     └── tells host: "IF2 and IF3 are one Video function"
-├── Interface 2 (VideoControl)
-└── Interface 3 (VideoStreaming)
+Byte 0:  0x02           HLE — header is 2 bytes long
+Byte 1:  BFH flags
+           bit 0 = FID  — Frame ID, toggles 0→1→0 every new frame
+           bit 1 = EOF  — 1 on the last packet of each frame
+Bytes 2-511: YUY2 pixel data (510 bytes of actual image)
 ```
 
-The Device Descriptor must also declare `bDeviceClass=0xEF, SubClass=0x02, Protocol=0x01` to signal IAD support.
-
----
-
-### 2. USB Enumeration — Step by Step
+**Frame boundary detection by the OS:**
 
 ```
-Host                                STM32
- |                                     |
- |──── USB Reset ─────────────────────>|
- |<─── Device Ready ───────────────────|  (D+ rises via 1.5kΩ pull-up on PA12)
- |                                     |
- |──── GET_DESCRIPTOR (Device) ───────>|
- |<─── 18 bytes ───────────────────────|  VID=0xCAFE, PID=0x4002, Class=0xEF
- |                                     |
- |──── SET_ADDRESS (e.g. addr=3) ─────>|
- |<─── ZLP ACK ────────────────────────|  ← address applied AFTER ZLP, not before!
- |                                     |
- |──── GET_DESCRIPTOR (Config) ───────>|
- |<─── 228 bytes ──────────────────────|  all interfaces, endpoints, class specifics
- |                                     |
- |──── GET_DESCRIPTOR (Strings) ──────>|  "BeeBotix", "BeeComposite", "001"
- |<─── UTF-16LE strings ───────────────|
- |                                     |
- |──── SET_CONFIGURATION (1) ─────────>|
- |<─── ZLP ACK ────────────────────────|  opens EP1, EP2, EP3
- |                                     |
- |  [Windows loads usbser.sys + usbvideo.sys — no install needed]
+Packet N:    BFH = 0x00  (FID=0, not EOF) — middle of frame
+Packet N+1:  BFH = 0x02  (FID=0, EOF=1)  — last packet of this frame
+Packet N+2:  BFH = 0x01  (FID=1, not EOF) — first packet of NEXT frame ← FID toggled!
 ```
 
----
+The OS watches for FID toggle to know "a new frame just started." If FID never
+toggles, the OS thinks it's one endless frame — video appears frozen.
 
-### 3. CDC ACM — Virtual Serial Port
-
-CDC ACM (Communications Device Class, Abstract Control Model) makes the device appear as a COM port. No baud rate is actually implemented in hardware — the "line coding" metadata (115200/8N1) is stored and echoed back, but data flows at USB speed.
-
-**Class requests after enumeration:**
-
-```
-Host                                STM32
- |──── SET_LINE_CODING ───────────>|  "Use 115200 baud, 8N1"
- |<─── ZLP ACK ─────────────────── |  we store it, never configure a UART
- |                                  |
- |──── SET_CONTROL_LINE_STATE ────>|  "DTR=1 (terminal open)"
- |<─── ZLP ACK ─────────────────── |  we note it, no hardware lines to toggle
- |                                  |
- |──── GET_LINE_CODING ───────────>|  "Confirm your settings"
- |<─── 7 bytes ─────────────────── |  return stored line coding
-```
-
-**Data flow (echo firmware):**
-
-```
-Host types "Hello"
-  → EP1 OUT bulk packet (64B max) → PMA at logical 0x100
-  → firmware reads PMA, copies to TX PMA at 0xC0
-  → EP1 IN bulk packet → host receives "Hello"
-```
-
----
-
-### 4. UVC — USB Video Class
-
-#### 4.1 Descriptor Hierarchy
-
-```
-Interface 2: VideoControl
-│
-├── VC Header        — UVC version 1.0, total VC length, lists VS interfaces
-├── Input Terminal   — bTerminalID=1, type=ITT_CAMERA (0x0201)
-│                      "I have a camera sensor"
-└── Output Terminal  — bTerminalID=2, type=TT_STREAMING (0x0101)
-                       bSourceID=1 → linked to Input Terminal
-                       "output goes to USB"
-
-Interface 3 alt0: VideoStreaming (zero bandwidth, default)
-Interface 3 alt1: VideoStreaming (active)
-│
-├── VS Input Header  — bNumFormats=1, bEndpointAddress=0x83, bTerminalLink=2
-├── VS Format        — guidFormat=YUY2, bBitsPerPixel=16
-└── VS Frame         — 176×144, 5fps, dwMaxVideoFrameSize=50688
-```
-
-#### 4.2 Probe & Commit Negotiation
-
-Before any frame data flows, host and device negotiate stream parameters:
-
-```
-Host                                      STM32
- |──── SET_CUR VS_PROBE_CONTROL ─────────>|  "Can you stream 176x144 YUY2 at 5fps?"
- |<─── ZLP ACK ────────────────────────── |  we store the request
- |                                         |
- |──── GET_CUR VS_PROBE_CONTROL ─────────>|  "What can you actually do?"
- |<─── 26 bytes (uvc_probe_t) ─────────── |  we return our supported params
- |                                         |
- |──── SET_CUR VS_COMMIT_CONTROL ────────>|  "Locked in. Start streaming."
- |<─── ZLP ACK ────────────────────────── |
- |                                         |
- |──── SET_INTERFACE (IF3, alt=1) ────────>|  "Open the ISO endpoint"
- |<─── ZLP ACK ────────────────────────── |  we enable EP3, set STAT_VALID
-```
-
-#### 4.3 UVC Payload Header
-
-Every USB packet sent on EP3 starts with a 2-byte UVC payload header:
-
-```
-Byte 0: HLE = 0x02  (header length = 2 bytes)
-Byte 1: BFH flags
-        bit 0 = FID  (Frame ID — toggles 0→1→0 on every new frame)
-        bit 1 = EOF  (End of Frame — set on last packet of each frame)
-        bits 2-7 = 0
-
-Bytes 2..511: YUY2 pixel data (510 bytes per packet)
-```
-
-**Example — two frames:**
-```
-Packet 1: [0x02, 0x00, pixels...]   FID=0, middle of frame 1
-Packet 2: [0x02, 0x02, pixels...]   FID=0, EOF=1, last packet of frame 1
-Packet 3: [0x02, 0x01, pixels...]   FID=1, start of frame 2  ← FID toggled!
-Packet 4: [0x02, 0x03, pixels...]   FID=1, EOF=1, last packet of frame 2
-```
-
-The OS uses FID to detect frame boundaries. Wrong FID = frozen or corrupted video.
-
-#### 4.4 YUY2 Pixel Format
+**YUY2 grayscale test pattern:**
 
 ```
 4 bytes = 2 pixels:
+[Y0] [U=128] [Y1] [V=128]
 
-  [Y0] [U] [Y1] [V]
-   │    │   │    └─ chroma red  (shared by both pixels)
-   │    │   └────── luma pixel 1
-   │    └────────── chroma blue (shared by both pixels)
-   └─────────────── luma pixel 0
-
-Grayscale: Y = brightness (0-255), U = 128, V = 128
+Y = (pixel_index + frame_counter) & 0xFF
+  → brightness ramps 0→255 across the frame, scrolls each frame
+  → appears as diagonal gray gradient moving across screen
+U = V = 128 → neutral chroma = no color tint
 ```
 
-Frame size: `176 × 144 × 2 = 50,688 bytes`
-
-#### 4.5 RAM Strategy — Streaming Without Buffering
+**Why we can't buffer a full frame (RAM limit):**
 
 ```
-Full frame = 50,688 bytes >> 20,480 bytes RAM → impossible to buffer
+Full frame:  176 × 144 × 2 = 50,688 bytes needed
+STM32 RAM:   20,480 bytes total
 
-Solution: generate pixels mathematically on the fly, 510 bytes at a time.
-Each time the ISO endpoint fires (every 1ms), compute the next 510 bytes
-of test pattern and send immediately. Never store the whole frame.
+50,688 > 20,480 → impossible to hold entire frame in RAM
+
+Solution: compute each 510-byte chunk mathematically as needed.
+No frame buffer. No DMA. CPU generates pixels on the fly each ISO slot.
 ```
 
 ---
 
-### 5. USB Hardware — STM32F103 PMA
+### Phase 6 — What Windows Does With All This
 
-The STM32F103 USB peripheral has 512 bytes of **Packet Memory Area (PMA)** at `0x40006000`. This is where USB data physically lives.
+Here is what Windows does at each stage of the above exchanges:
 
-**Critical addressing rule:**
 ```
-PMA is 16-bit wide on a 32-bit AHB bus.
-Each 16-bit word occupies a 32-bit slot.
-Logical byte offset L → physical address = 0x40006000 + L×2
+After Device Descriptor:
+  → Reads VID=0xCAFE, PID=0x4002, Class=0xEF
+  → Looks up in driver database: no match for VID/PID (custom device)
+  → Reads Class=0xEF: "composite IAD device, check config for functions"
+
+After Configuration Descriptor:
+  → Walks all 228 bytes, finds IAD[0]: Class=0x02 (CDC)
+    → Loads usbser.sys, assigns it IF0+IF1
+  → Finds IAD[1]: Class=0x0E (Video)
+    → Loads usbvideo.sys, assigns it IF2+IF3
+  → Creates three device nodes in Device Manager:
+      USB\VID_CAFE&PID_4002\001          (composite parent)
+      USB\VID_CAFE&PID_4002&MI_00\...   (CDC child → COM port)
+      USB\VID_CAFE&PID_4002&MI_02\...   (UVC child → camera)
+
+After String Descriptors:
+  → Shows "BeeComposite" as device friendly name
+  → Shows "BeeBotix" as manufacturer
+
+After SET_CONFIGURATION:
+  → Opens all endpoints, device is live
+
+After CDC class requests:
+  → COM port appears in "Ports (COM & LPT)"
+  → Applications can open COMx
+
+After UVC Probe/Commit + SET_INTERFACE:
+  → Camera appears in "Cameras" or "Imaging devices"
+  → Camera app / VLC / OpenCV can open the video stream
 ```
-
-**Our PMA layout:**
-
-| Logical Offset | Size | Contents |
-|---|---|---|
-| `0x000–0x03F` | 64B | BTABLE (buffer descriptor table, 4 EPs × 8 bytes) |
-| `0x040–0x07F` | 64B | EP0 TX (control IN) |
-| `0x080–0x0BF` | 64B | EP0 RX (control OUT / SETUP) |
-| `0x0C0–0x0FF` | 64B | EP1 TX (CDC bulk IN) |
-| `0x100–0x13F` | 64B | EP1 RX (CDC bulk OUT) |
-| `0x140–0x17F` | 64B | EP2 TX (CDC interrupt, NAK only) |
-| `0x180–0x37F` | 512B | EP3 TX (UVC ISO IN) |
 
 ---
 
-### 6. EPR Register — The Toggle-Bit Problem
+## PMA — How Data Actually Moves
 
-The Endpoint Register (`USB_EPR`) is not a normal read/write register. Writing it incorrectly silently corrupts endpoint state:
+The STM32F103 USB peripheral has 512 bytes of dedicated **Packet Memory Area (PMA)**
+at physical address `0x40006000`. This SRAM is shared between CPU and USB hardware.
+
+**The CPU writes here to send data. The USB hardware reads from here and puts it on the wire.**
+**The USB hardware writes here when it receives data. The CPU reads from here.**
+
+Critical hardware detail — PMA is 16-bit wide on a 32-bit bus:
 
 ```
-Bits 15,7  (CTR_RX, CTR_TX):  write-0-to-clear  → must write 1 to preserve
-Bits 14,6  (DTOG_RX, DTOG_TX): toggle-on-write  → XOR trick required
-Bits 13:12 (STAT_RX):          toggle-on-write  → XOR to reach desired value
-Bits 11,10,9,8,3:2,1,0:        normal R/W       → write desired value directly
-Bits 6:4   (STAT_TX):          toggle-on-write  → XOR to reach desired value
+Each 16-bit word occupies a 32-bit physical slot:
+  Logical offset 0  → physical 0x40006000
+  Logical offset 2  → physical 0x40006004  (NOT 0x40006002!)
+  Logical offset 4  → physical 0x40006008
+  Logical offset N  → physical 0x40006000 + N×2
+
+This is why all PMA writes use ×2:
 ```
 
-Correct pattern to set STAT_TX to VALID (0b11):
 ```c
-uint16_t v = USB_EPR(ep);
-uint16_t w = (v & EPR_RW) | EP_CTR_RX | EP_CTR_TX;  // preserve, keep CTR high
-w ^= ((v ^ (STAT_VALID << 4)) & EP_STAT_TX);          // XOR only STAT_TX bits
-USB_EPR(ep) = w;
+static void pma_write(uint16_t logical_offset, const uint8_t *src, uint16_t len) {
+    // Convert logical offset to physical pointer (×2 for 32-bit slot spacing)
+    volatile uint16_t *dst = (volatile uint16_t*)(0x40006000 + logical_offset * 2);
+    for (uint16_t i = 0; i < len; i += 2) {
+        uint16_t word = src[i];
+        if (i+1 < len) word |= (src[i+1] << 8);
+        *dst = word;
+        dst += 2;  // advance by 4 bytes (one 32-bit slot)
+    }
+}
 ```
+
+Getting the ×2 wrong means data lands at a completely different address in PMA —
+the device descriptor ends up where the RX buffer should be. This was the hardest
+bug in this project to find.
 
 ---
 
-## PMA Layout Diagram
+## EPR Register — Why It's Tricky
+
+`USB_EPR(n)` at `0x40005C00 + n×4` is not a normal read/write register.
+It has three different write behaviors on different bits:
 
 ```
-0x40006000  ┌─────────────────┐
-            │  BTABLE EP0     │  ADDR_TX, CNT_TX, ADDR_RX, CNT_RX
-0x40006010  ├─────────────────┤
-            │  BTABLE EP1     │
-0x40006020  ├─────────────────┤
-            │  BTABLE EP2     │
-0x40006030  ├─────────────────┤
-            │  BTABLE EP3     │
-0x40006040  ├─────────────────┤  ← logical 0x40 × 2 = physical +0x80
-            │  EP0 TX (64B)   │  control responses
-0x400060C0  ├─────────────────┤  ← logical 0x80 × 2 = physical +0x100
-            │  EP0 RX (64B)   │  SETUP + control OUT
-0x40006140  ├─────────────────┤  ← logical 0xC0 × 2 = physical +0x180
-            │  EP1 TX (64B)   │  CDC serial → host
-0x400061C0  ├─────────────────┤
-            │  EP1 RX (64B)   │  CDC serial ← host
-0x40006240  ├─────────────────┤
-            │  EP2 TX (64B)   │  CDC notification (NAK)
-0x400062C0  ├─────────────────┤
-            │  EP3 TX (512B)  │  UVC ISO video frames
-0x400064C0  └─────────────────┘  (end of 512B PMA, tight fit!)
+Bit 15  CTR_RX  : read-only (write 0 to clear, write 1 = no effect)
+Bit 14  DTOG_RX : toggle-on-write (write 1 = toggle, write 0 = no change)
+Bit 13:12 STAT_RX: toggle-on-write (XOR to reach desired state)
+Bit 11  SETUP   : read-only
+Bit 10:9 EP_TYPE: normal read/write
+Bit 8   EP_KIND : normal read/write
+Bit 7   CTR_TX  : read-only (write 0 to clear, write 1 = no effect)
+Bit 6   DTOG_TX : toggle-on-write
+Bit 6:4 STAT_TX : toggle-on-write
+Bit 3:0 EA      : normal read/write (endpoint address)
 ```
+
+To set STAT_TX to VALID (0b11) without disturbing other bits:
+
+```c
+void ep_stat_tx(uint8_t ep, uint16_t desired) {
+    uint16_t current = USB_EPR(ep);
+
+    // Build write value:
+    // - Keep all normal R/W bits as-is
+    // - Write 1 to CTR bits (to NOT clear them)
+    // - XOR STAT_TX: current XOR (current XOR desired) = desired
+    uint16_t write = (current & EPR_RW_MASK) | EP_CTR_RX | EP_CTR_TX;
+    write ^= ((current ^ (desired << 4)) & EP_STAT_TX);
+
+    USB_EPR(ep) = write;
+}
+```
+
+If you just do `USB_EPR(ep) = 0x0320` to set VALID+CONTROL, you'll accidentally
+clear CTR_TX (which was set by hardware to signal "transfer complete") and accidentally
+toggle DTOG. The result: missed transfers and data corruption that's very hard to debug.
 
 ---
 
-## Clock — Why HSE Is Mandatory
+## Clock — The Silent Killer
 
 ```
-HSI (internal RC oscillator):
+First attempt used HSI (internal RC oscillator):
   Accuracy: ±1%
-  USB requires: ±0.25%
-  Result: HOST REJECTS DEVICE  ← our initial bug
+  USB spec requires: ±0.25%
+  What happened: host saw garbled bit timing, responded with "Device Descriptor Request Failed"
 
-HSE (external 8MHz crystal, Blue Pill has this):
+Fixed by switching to HSE (8MHz external crystal on Blue Pill):
   Accuracy: ±50ppm = ±0.005%
-  Result: USB works perfectly
+  USB works perfectly
 
-Our PLL config:
-  HSE = 8MHz → PLL × 6 = 48MHz SYSCLK
-  USB clock = PLL / 1 = 48MHz  ← USB requires exactly 48MHz
+PLL configuration for exactly 48MHz:
+  HSE = 8MHz
+  PLL multiplier = ×6
+  SYSCLK = 48MHz
+  USB clock source = PLL (÷1) = 48MHz  ← USB hardware requires exactly 48MHz
 ```
 
----
-
-## Project File Structure
-
+```c
+osc.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+osc.PLL.PLLMUL    = RCC_PLL_MUL6;      // 8MHz × 6 = 48MHz
 ```
-bluepill-uvc/
-│
-├── README.md
-├── platformio.ini          ← stm32cube framework, stlink upload
-│
-├── src/
-│   ├── main.c              ← HSE clock init, D+ pull-down, 3 blinks, poll loop
-│   └── usb_core.c          ← Complete USB stack: CDC ACM + UVC, raw registers
-│
-└── include/
-    ├── usb_regs.h           ← PMA macros, EPR toggle helpers, buffer offsets
-    └── uvc_desc.h           ← UVC structs (uvc_probe_t), constants
-```
+
+The original bootloader always worked because it uses HSE. Our first firmware used HSI
+and produced `VID_0000&PID_0002` (Windows code for "I got garbage and gave up").
 
 ---
 
 ## Build & Flash
 
 ```bash
-# Build
-pio run
-
-# Flash via ST-Link
 pio run --target upload
+```
 
-# Verify enumeration (Windows PowerShell)
+```powershell
+# Verify (Windows)
 Get-PnpDevice | Where-Object { $_.InstanceId -like "USB\VID_CAFE*" } |
     Select-Object Status, FriendlyName, InstanceId
 
-# Test serial echo (replace COM10 with your port)
+# Expected:
+# OK  USB Composite Device       USB\VID_CAFE&PID_4002\001
+# OK  USB Serial Device (COM10)  USB\VID_CAFE&PID_4002&MI_00\...
+# OK  BeeComposite                USB\VID_CAFE&PID_4002&MI_02\...
+
+# Test serial echo
 $p = New-Object System.IO.Ports.SerialPort "COM10",115200
 $p.Open(); $p.Write("Hello"); Start-Sleep -ms 100; $p.ReadExisting(); $p.Close()
+
+# View camera (Python)
+pip install opencv-python
+python view_uvc.py
 ```
 
 ---
 
-## Verify It Works
+## File Structure
 
-### Windows
 ```
-Device Manager:
-  Ports (COM & LPT)         → USB Serial Device (COMx)   ✓
-  Cameras                   → BeeComposite                ✓
-  Universal Serial Bus       → USB Composite Device       ✓
-
-Camera app: shows scrolling gray gradient pattern
+bluepill-uvc/
+├── README.md
+├── platformio.ini
+├── src/
+│   ├── main.c       — HSE clock, D+ disconnect, 3 blinks, poll loop
+│   └── usb_core.c   — Complete USB stack: enumeration, CDC, UVC, streaming
+└── include/
+    ├── usb_regs.h   — PMA macros, EPR helpers, buffer offsets
+    └── uvc_desc.h   — uvc_probe_t struct, UVC constants
 ```
-
-### Linux
-```bash
-lsusb | grep CAFE
-# Bus 001 Device 005: ID cafe:4002
-
-ls /dev/ttyACM*   # serial
-ls /dev/video*    # camera
-
-# View camera stream
-ffplay /dev/video0
-# or
-vlc v4l2:///dev/video0
-```
-
----
-
-## Expected Camera Output
-
-A **diagonal grayscale gradient** that scrolls across the frame. This proves:
-
-- USB enumeration succeeded ✅
-- IAD composite device recognized ✅
-- UVC descriptors valid (Input + Output terminals present) ✅
-- Probe/Commit negotiation completed ✅
-- ISO endpoint streaming data ✅
-- Frame ID toggling correct ✅
-- OS UVC driver decoded YUY2 correctly ✅
 
 ---
 
 ## Limitations vs H-Series
 
-| Limitation | Blue Pill | H7 / H5 Solution |
+| | Blue Pill | STM32H7 |
 |---|---|---|
-| 20 KB RAM | No frame buffer, stream live | 1MB+ RAM, DMA frame buffers |
-| 12 Mbps USB FS | ~10fps max at 176×144 | USB HS 480Mbps → 30-60fps+ |
-| No DCMI | Test pattern only | DCMI/CSI for real camera sensor |
-| 72 MHz CPU | Pattern generation only | 480-550 MHz + HW JPEG encoder |
-| 512B PMA | Tight endpoint budget | Larger PMA, more endpoints |
+| RAM | 20KB — no frame buffer | 1MB+ — triple buffer |
+| USB | FS 12Mbps — ~10fps | HS 480Mbps — 60fps+ |
+| Camera | Test pattern (no sensor) | DCMI/CSI — real sensor |
+| CPU | 48MHz for this project | 480MHz + HW JPEG |
 
-Everything learned here — descriptors, Probe/Commit, payload headers, FID toggling, EPR toggle bits — is **identical on H-series**. Only peripheral registers change.
-
----
-
-## Debugging
-
-```powershell
-# Full device details
-Get-PnpDevice -InstanceId "USB\VID_CAFE&PID_4002\001" | Format-List *
-
-# Check UVC error code
-Get-PnpDeviceProperty -InstanceId "USB\VID_CAFE&PID_4002&MI_02\..." `
-    -KeyName DEVPKEY_Device_ProblemCode | Select-Object Data
-# Code 10 = descriptor issue
-# Code 28 = no driver matched
-# Code 43 = device rejected by driver
-
-# OpenOCD memory dump (run from project dir)
-C:\Users\..\.platformio\packages\tool-openocd\bin\openocd.exe `
-    -f interface/stlink.cfg -f target/stm32f1x.cfg `
-    -c "init; halt; sleep 200; mdw 0x40005C00 8; mdw 0x40006000 16; resume; shutdown"
-```
+All concepts here — descriptors, Probe/Commit, FID toggling, EPR bits, PMA layout —
+are identical on H-series. Only the peripheral register addresses change.
 
 ---
 
 ## References
 
+- USB 2.0 Specification — usb.org
 - USB Video Class Specification 1.5 — usb.org
 - USB CDC Specification 1.2 — usb.org
 - STM32F103 Reference Manual RM0008 — st.com
-- USB 2.0 Specification — usb.org/document-library
